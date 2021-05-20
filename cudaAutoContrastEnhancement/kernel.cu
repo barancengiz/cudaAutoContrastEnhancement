@@ -17,44 +17,46 @@ typedef unsigned char uint8_t;
 
 cudaError_t contrastEnhancementCuda(uint8_t *img, uint8_t &min_host, uint8_t &max_host, const int size);
 
-__global__ void minKernel(uint8_t* img, uint8_t* o_img, const int size) {
+__global__ void minKernel(uint8_t* dev_img, uint8_t* dev_shm, const int size) {
 
     // Shared memory for threads in the same block
-    extern __shared__ uint8_t sdata_minKernel[];
+    extern __shared__ uint8_t sdata[];
 
     unsigned int tid = threadIdx.x;
-    // TODO: Check blockDim * 2 option
-    unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+    unsigned int idx = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+
+    sdata[tid] = 255;
 
     // Initialize shared memory
-    if (i + blockDim.x < size) {
-        sdata_minKernel[tid] = img[i] < img[i + blockDim.x] ? img[i] : img[i + blockDim.x];
+    if (idx + blockDim.x < size) {
+        sdata[tid] = (uint8_t) min(dev_img[idx], dev_img[idx+blockDim.x]);
     }
     else {
-        sdata_minKernel[tid] = img[i];
+        sdata[tid] = dev_img[idx];
     }
     __syncthreads();
 
+    // s: stride
     for (int s = blockDim.x / 2; s > 32; s >>= 1)
     {
-        if (tid < s) {
-            sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + s] ? sdata_minKernel[i] : sdata_minKernel[i + s];
+        if (tid < s && idx + s < size) {
+            sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + s]);
         }
         __syncthreads();
     }
     
     // Unroll the last warp
     if (tid < 32) {
-        sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + 32] ? sdata_minKernel[i] : sdata_minKernel[i + 32];
-        sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + 16] ? sdata_minKernel[i] : sdata_minKernel[i + 16];
-        sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + 8] ? sdata_minKernel[i] : sdata_minKernel[i + 8];
-        sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + 4] ? sdata_minKernel[i] : sdata_minKernel[i + 4];
-        sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + 2] ? sdata_minKernel[i] : sdata_minKernel[i + 2];
-        sdata_minKernel[tid] = sdata_minKernel[i] < sdata_minKernel[i + 1] ? sdata_minKernel[i] : sdata_minKernel[i + 1];
+        sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + 32]);
+        sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + 16]);
+        sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + 8]);
+        sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + 4]);
+        sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + 2]);
+        sdata[tid] = (uint8_t) min(sdata[tid], sdata[tid + 1]);
     }
 
     if (tid == 0) {
-        o_img[blockIdx.x] = sdata_minKernel[0];
+        dev_shm[blockIdx.x] = sdata[0];
     }
 }
 
@@ -181,32 +183,21 @@ cudaError_t contrastEnhancementCuda(uint8_t *img, uint8_t &min_host, uint8_t &ma
 {
     int blockSize = NUM_THREADS;
     int gridSize = size / blockSize + (size % blockSize != 0);
-
-    dim3 grid, block;
-    block.x = NUM_THREADS;
-    grid.x = size / block.x + (size % block.x != 0);
     
-    // Temp CPU array
-    uint8_t* min_array = new uint8_t [grid.x];
-    //uint8_t* min_array = (uint8_t*) malloc( sizeof(uint8_t) * (size / NUM_THREADS + (size % NUM_THREADS != 0))) ;
-
-    // Device memory pointers
+    // Temp CPU array that hold min values of each block. We need half of the gridSize since 
+    uint8_t* min_array;
+    min_array = (uint8_t*) malloc(ceil(gridSize / 2) * sizeof(uint8_t));
+    // Device memory pointers for image and block minima
     uint8_t *dev_img = 0;
-    uint8_t *dev_min_array = 0;
-
+    uint8_t *dev_shm = 0;
     cudaError_t cudaStatus;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
 
-    // Allocate GPU memory for the image.
+    // Allocate GPU memory for the image and minima of seperate blocks
     cudaStatus = cudaMalloc((void**)&dev_img, size * sizeof(uint8_t));
-    //cudaMemset(dev_img, 0, size * sizeof(uint8_t));
-
-    // Allocate GPU memory for min values of separate blocks.
-    cudaStatus = cudaMalloc((void**)&dev_min_array, sizeof(uint8_t) * grid.x);
-    //cudaMemset(dev_min_array, 0, sizeof(uint8_t) * grid.x);
-
+    cudaStatus = cudaMalloc((void**)&dev_shm, ceil(gridSize/2) * sizeof(uint8_t));
     // Copy the image from host memory to GPU.
     cudaMemcpy(dev_img, img, size * sizeof(uint8_t), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
@@ -214,33 +205,36 @@ cudaError_t contrastEnhancementCuda(uint8_t *img, uint8_t &min_host, uint8_t &ma
         goto Error;
     }
     
-    int smem_size = block.x * sizeof(uint8_t);
+    // Shared memory of size NUM_THREADS in a block
+    int smem_size = blockSize * sizeof(uint8_t);
  
+    dim3 grid, block;
+    block.x = blockSize;
+    grid.x = gridSize/2;
 
     //// Launch a kernel on the GPU with one thread for each element.
-    //minKernel<<<grid, block, smem_size, 0>>>(dev_img, dev_min_array, size);
+    minKernel<<<grid, block, smem_size, 0>>>(dev_img, dev_shm, size);
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "minMaxKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+        goto Error;
+    }
+    // Copy output vector from GPU buffer to host memory.
+    cudaStatus = cudaMemcpy(min_array, dev_shm, ceil(gridSize / 2) * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy min failed!");
+        goto Error;
+    }
 
-    //// Check for any errors launching the kernel
-    //cudaStatus = cudaGetLastError();
-    //if (cudaStatus != cudaSuccess) {
-    //    fprintf(stderr, "minMaxKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-    //    goto Error;
-    //}
-   
-    //// Copy output vector from GPU buffer to host memory.
-    //cudaStatus = cudaMemcpy(min_array, dev_min_array, sizeof(uint8_t) * grid.x, cudaMemcpyDeviceToHost);
-    //if (cudaStatus != cudaSuccess) {
-    //    fprintf(stderr, "cudaMemcpy min failed!");
-    //    goto Error;
-    //}
-    //min_host = 255;
-    //for (size_t i = 0; i < NUM_THREADS; i++)
-    //{
-    //    if (min_array[i] < min_host) {
-    //        min_host = min_array[i];
-    //    }
-    //}
-    //
+    min_host = 255;
+    for (size_t i = 0; i < NUM_THREADS; i++)
+    {
+        if (min_array[i] < min_host) {
+            min_host = min_array[i];
+        }
+    }
+    printf("nMin: %d\n", min_host);
+
     //maxKernel << <grid, block, smem_size, 0 >> > (dev_img, dev_min_array, size);
 
     //// Check for any errors launching the kernel
@@ -275,16 +269,17 @@ cudaError_t contrastEnhancementCuda(uint8_t *img, uint8_t &min_host, uint8_t &ma
 
     uint8_t* dev_min;
     float* dev_scale;
+    grid.x = gridSize;
 
     cudaStatus = cudaMalloc((void**)&dev_min, sizeof(uint8_t));
     cudaStatus = cudaMemcpy(dev_min, &min_host, sizeof(uint8_t), cudaMemcpyHostToDevice);
-    subtractMinKernel<<<grid, block, sizeof(uint8_t), 0>>> (dev_img, dev_min, size);
+    subtractMinKernel<<<grid, block>>> (dev_img, dev_min, size);
     cudaStatus = cudaMemcpy(img, dev_img, sizeof(uint8_t) * size, cudaMemcpyDeviceToHost);
     printf("### After subtraction %d\n", img[DEBUG_IMG_IDX]);
 
     cudaStatus = cudaMalloc((void**)&dev_scale, sizeof(float));
     cudaStatus = cudaMemcpy(dev_scale, &scale_constant, sizeof(float), cudaMemcpyHostToDevice);
-    scaleKernel<< <grid, block, sizeof(float), 0 >> > (dev_img, dev_scale, size);
+    scaleKernel<< <grid, block>> > (dev_img, dev_scale, size);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "scaleKernel failed!");
         goto Error;
@@ -294,7 +289,7 @@ cudaError_t contrastEnhancementCuda(uint8_t *img, uint8_t &min_host, uint8_t &ma
 
 Error:
     cudaFree(dev_img);
-    cudaFree(dev_min_array);
+    cudaFree(dev_shm);
     free(min_array);
     
     return cudaStatus;
